@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MC 服务器状态 (鉴权版)</title>
+    <style>
+        body { font-family: sans-serif; background: #f4f4f4; padding: 20px; display: flex; justify-content: center; }
+        .container { background: #fff; padding: 25px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); width: 100%; max-width: 600px; }
+        h1 { font-size: 1.4em; }
+        .info-block { margin-bottom: 15px; padding-bottom: 15px; border-bottom: 1px solid #eee; }
+        .label { font-weight: bold; margin-right: 5px; }
+        .motd { font-family: monospace; background: #fafafa; padding: 10px; border: 1px solid #eee; white-space: pre-wrap; }
+        .players-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+        .player-item { background: #eee; padding: 5px 10px; border-radius: 4px; font-size: 0.9em; }
+        button { padding: 8px 16px; background: #333; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:disabled { background: #999; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Minecraft 服务器状态 
+        <button style="float:right; padding:4px 10px; font-size:0.9em;" onclick="fetchStatus()">刷新</button>
+    </h1>
+    
+    <div id="statusArea">
+        <div class="info-block">
+            <span class="label">MOTD:</span>
+            <div id="motdText" class="motd"></div>
+        </div>
+        <div class="info-block">
+            <span class="label">版本:</span> <span id="versionText"></span>
+        </div>
+        <div class="info-block">
+            <span class="label">人数:</span> <span id="playersCount"></span>
+        </div>
+        <div class="info-block">
+            <div><span class="label">在线玩家:</span></div>
+            <div id="playersList" class="players-list"></div>
+        </div>
+    </div>
+    <div id="errorMsg" style="color:red;"></div>
+</div>
+
+<script>
+    // 1. 你的 C++ 代理公网地址 (FRP 映射)
+    const PROXY_URL = "http://你的FRP公网IP:8080"; 
+
+    let lastRefreshTime = 0;
+    let isFetching = false;
+    let currentSvr = "";
+    let currentToken = "";
+
+    // 2. 解析 URL 参数 ?svr=...&token=...
+    window.onload = function() {
+        const params = new URLSearchParams(window.location.search);
+        currentSvr = params.get('svr');
+        currentToken = params.get('token');
+
+        if (!currentSvr || !currentToken) {
+            document.getElementById("errorMsg").innerText = "缺少 svr 或 token 参数，无权访问。";
+            document.getElementById("statusArea").style.display = 'none';
+            return;
+        }
+        fetchStatus();
+    };
+
+    // 3. 使用 Web Crypto API 异步计算 SHA-512
+    async function generateHash(token, timestamp) {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(token + timestamp);
+        const hashBuffer = await crypto.subtle.digest('SHA-512', data);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function fetchStatus(isRetry = false) {
+        if (isFetching) return;
+        const now = Date.now();
+        if (now - lastRefreshTime < 1000) {
+            document.getElementById("errorMsg").innerText = "刷新太快，请等1秒";
+            return;
+        }
+        
+        isFetching = true;
+        lastRefreshTime = now;
+        document.getElementById("errorMsg").innerText = "";
+
+        try {
+            // 获取当前 Unix 时间戳 (秒)
+            const ts = Math.floor(Date.now() / 1000);
+            // 生成 SHA-512 密钥
+            const hash = await generateHash(currentToken, ts);
+
+            // 构造带鉴权的 URL
+            const targetUrl = `${PROXY_URL}/?svr=${encodeURIComponent(currentSvr)}&ts=${ts}&hash=${hash}`;
+            const response = await fetch(targetUrl);
+            const data = await response.json();
+
+            if (data.error) throw new Error(data.error);
+
+            // 填充基础信息
+            document.getElementById('versionText').innerText = data.version?.name || "未知";
+            document.getElementById('playersCount').innerText = `${data.players?.online || 0} / ${data.players?.max || 0}`;
+
+            let motdText = "无 MOTD";
+            if (data.description) {
+                if (typeof data.description === 'string') motdText = data.description;
+                else if (data.description.text) motdText = data.description.text;
+                else if (data.description.extra) motdText = data.description.extra.map(e => e.text).join('');
+            }
+            document.getElementById('motdText').innerText = motdText;
+
+            const playersListEl = document.getElementById('playersList');
+            playersListEl.innerHTML = '';
+            let needRetry = false;
+
+            if (data.players?.sample && data.players.sample.length > 0) {
+                data.players.sample.forEach(player => {
+                    const name = player.name;
+                    if (!name || name.trim() === "") {
+                        needRetry = true;
+                    } else {
+                        const div = document.createElement('div');
+                        div.className = 'player-item';
+                        div.innerText = name;
+                        playersListEl.appendChild(div);
+                    }
+                });
+            } else if (data.players?.online > 0) {
+                playersListEl.innerHTML = `<span style="color:#888;">(${data.players.online} 人在线，服务器隐藏了列表)</span>`;
+            } else {
+                playersListEl.innerHTML = '<span style="color:#888;">暂无在线玩家</span>';
+            }
+
+            if (needRetry && !isRetry) {
+                isFetching = false;
+                setTimeout(() => fetchStatus(true), 500);
+            }
+
+        } catch (error) {
+            document.getElementById("errorMsg").innerText = "获取失败: " + error.message;
+        } finally {
+            isFetching = false;
+        }
+    }
+</script>
+
+</body>
+</html>
